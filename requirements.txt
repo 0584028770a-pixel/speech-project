@@ -1,3 +1,4 @@
 requests>=2.31.0
 SpeechRecognition>=3.10.0
 edge-tts>=6.1.9
+static-ffmpeg>=2.5
