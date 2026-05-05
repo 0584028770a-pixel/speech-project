@@ -40,9 +40,20 @@ HEALTH_EVERY   = 10   # הדפסת health check כל X מחזורים
 TIMEOUT_SHORT  = 10   # login, get_files
 TIMEOUT_LONG   = 30   # download, upload, TTS, AI
 
-SYSTEM_PROMPT = """אתה עוזר קולי של מערכת ימות המשיח.
-ענה תמיד בעברית בלבד.
-תן תשובה קצרה וברורה המתאימה להשמעה בטלפון."""
+SYSTEM_PROMPT = """אתה עוזר קולי חכם של מערכת ימות המשיח. ענה תמיד בעברית בלבד.
+תן תשובה קצרה וברורה — משפט או שניים, מתאים לשמיעה בטלפון.
+
+כללים:
+- הגדרות, מדע, היסטוריה, תרבות, הלכה — ענה בביטחון מהידע שלך.
+- אם קיבלת מידע מהאינטרנט בתחילת ההודעה (מסומן ב-[מידע עדכני]) — השתמש בו בתשובה.
+- אם אינך יודע — אמור זאת ישירות בלי להמציא."""
+
+NEEDS_SEARCH_PROMPT = """האם השאלה הבאה דורשת מידע עדכני מהאינטרנט?
+שאלות שדורשות חיפוש: מי מכהן בתפקיד כלשהו, מה השעה/תאריך/כניסת שבת, חדשות, מזג אוויר, שערי מטבע, מחירים.
+שאלות שלא דורשות חיפוש: הגדרות, היסטוריה, מדע, הלכה, מתמטיקה, שאלות כלליות.
+
+ענה במילה אחת בלבד: כן או לא.
+שאלה: """
 
 session = requests.Session()
 session.headers.update({"User-Agent": "YemotAI/1.0"})
@@ -115,7 +126,67 @@ def _upload(token, wav_path):
 
 
 # ===== AI =====
-def _ask_groq(user_text):
+def _needs_search(user_text: str) -> bool:
+    """שואל את הבינה אם השאלה דורשת חיפוש — קריאה קלה עם מודל קטן"""
+    try:
+        resp = session.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": "llama-3.1-8b-instant",   # מודל קטן וזול לשאלת כן/לא
+                "messages": [{"role": "user", "content": NEEDS_SEARCH_PROMPT + user_text}],
+                "max_tokens": 5
+            },
+            timeout=TIMEOUT_SHORT
+        )
+        resp.raise_for_status()
+        answer = resp.json()["choices"][0]["message"]["content"].strip().lower()
+        return "כן" in answer or "yes" in answer
+    except Exception as e:
+        log.warning(f"בדיקת חיפוש נכשלה: {e} — ממשיך ללא חיפוש")
+        return False
+
+def _tavily_search(query: str) -> str:
+    """מחזיר תקציר תוצאות חיפוש מ-Tavily"""
+    try:
+        resp = session.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": os.getenv("TAVILY_API_KEY"),
+                "query": query,
+                "search_depth": "basic",
+                "max_results": 3
+            },
+            timeout=TIMEOUT_LONG
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        results = data.get("results", [])
+        if not results:
+            return ""
+        # מחזיר את התוכן הרלוונטי בלבד
+        snippets = [r.get("content", "")[:200] for r in results[:2]]
+        return " | ".join(snippets)
+    except Exception as e:
+        log.warning(f"חיפוש Tavily נכשל: {e}")
+        return ""
+
+def _ask_groq(user_text: str) -> str:
+    # שלב 1: האם צריך חיפוש?
+    tavily_key = os.getenv("TAVILY_API_KEY")
+    context = ""
+
+    if tavily_key and _needs_search(user_text):
+        log.info("🔍 מחפש מידע עדכני...")
+        context = _tavily_search(user_text)
+        if context:
+            log.info(f"נמצא מידע: {context[:80]}...")
+
+    # שלב 2: בונה הודעה עם הקשר אם יש
+    user_message = user_text
+    if context:
+        user_message = f"[מידע עדכני מהאינטרנט]: {context}\n\nשאלה: {user_text}"
+
     resp = session.post(
         "https://api.groq.com/openai/v1/chat/completions",
         headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
@@ -123,7 +194,7 @@ def _ask_groq(user_text):
             "model": "llama-3.3-70b-versatile",
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_text}
+                {"role": "user", "content": user_message}
             ],
             "max_tokens": 200
         },
