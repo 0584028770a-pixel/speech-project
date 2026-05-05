@@ -9,6 +9,10 @@ import urllib.parse
 import json
 import requests
 import speech_recognition as sr
+import static_ffmpeg
+
+# הוסף ffmpeg ל-PATH אוטומטית (עובד ב-Railway ללא nixpacks)
+static_ffmpeg.add_paths()
 
 # ===== Logging =====
 logging.basicConfig(
