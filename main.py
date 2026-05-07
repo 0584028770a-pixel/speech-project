@@ -44,8 +44,10 @@ SYSTEM_PROMPT = """אתה עוזר קולי חכם של מערכת ימות המ
 תן תשובה קצרה וברורה — משפט או שניים, מתאים לשמיעה בטלפון.
 
 כללים:
-- הגדרות, מדע, היסטוריה, תרבות, הלכה — ענה בביטחון מהידע שלך.
-- אם קיבלת מידע מהאינטרנט בתחילת ההודעה (מסומן ב-[מידע עדכני]) — השתמש בו בתשובה.
+- דיוק מעל הכל — עדיף להגיד "איני בטוח" מאשר לטעות.
+- שיעורים הלכתיים (רביעית, כזית, כביצה וכו') — היזהר מאוד: רביעית = כ-86 עד 150 מ"ל, לא ליטרים.
+- הגדרות, מדע, היסטוריה, תרבות — ענה בביטחון מהידע שלך.
+- אם קיבלת מידע עדכני מהאינטרנט (מסומן ב-[מידע עדכני]) — השתמש בו.
 - אם אינך יודע — אמור זאת ישירות בלי להמציא."""
 
 NEEDS_SEARCH_PROMPT = """האם השאלה הבאה דורשת מידע עדכני מהאינטרנט?
@@ -125,6 +127,7 @@ def _upload(token, wav_path):
     raise Exception(f"שגיאת העלאה: {data.get('message')}")
 
 
+
 # ===== AI =====
 def _needs_search(user_text: str) -> bool:
     """שואל את הבינה אם השאלה דורשת חיפוש — קריאה קלה עם מודל קטן"""
@@ -133,7 +136,7 @@ def _needs_search(user_text: str) -> bool:
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
             json={
-                "model": "llama-3.1-8b-instant",   # מודל קטן וזול לשאלת כן/לא
+                "model": "llama-3.1-8b-instant",
                 "messages": [{"role": "user", "content": NEEDS_SEARCH_PROMPT + user_text}],
                 "max_tokens": 5
             },
@@ -164,29 +167,32 @@ def _tavily_search(query: str) -> str:
         results = data.get("results", [])
         if not results:
             return ""
-        # מחזיר את התוכן הרלוונטי בלבד
         snippets = [r.get("content", "")[:200] for r in results[:2]]
         return " | ".join(snippets)
     except Exception as e:
         log.warning(f"חיפוש Tavily נכשל: {e}")
         return ""
 
-def _ask_groq(user_text: str) -> str:
-    # שלב 1: האם צריך חיפוש?
-    tavily_key = os.getenv("TAVILY_API_KEY")
-    context = ""
+def _ask_gemini(user_message: str) -> str:
+    """שואל את Gemini 2.0 Flash — חכם יותר, חינמי"""
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    if not gemini_key:
+        raise Exception("GEMINI_API_KEY חסר")
+    resp = session.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={gemini_key}",
+        json={
+            "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+            "contents": [{"parts": [{"text": user_message}]}],
+            "generationConfig": {"maxOutputTokens": 200, "temperature": 0.3}
+        },
+        timeout=TIMEOUT_LONG
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data["candidates"][0]["content"]["parts"][0]["text"]
 
-    if tavily_key and _needs_search(user_text):
-        log.info("🔍 מחפש מידע עדכני...")
-        context = _tavily_search(user_text)
-        if context:
-            log.info(f"נמצא מידע: {context[:80]}...")
-
-    # שלב 2: בונה הודעה עם הקשר אם יש
-    user_message = user_text
-    if context:
-        user_message = f"[מידע עדכני מהאינטרנט]: {context}\n\nשאלה: {user_text}"
-
+def _ask_groq_fallback(user_message: str) -> str:
+    """Groq כ-fallback אם Gemini נכשל"""
     resp = session.post(
         "https://api.groq.com/openai/v1/chat/completions",
         headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
@@ -205,6 +211,34 @@ def _ask_groq(user_text: str) -> str:
     if "choices" in data:
         return data["choices"][0]["message"]["content"]
     raise Exception(f"שגיאת Groq: {data}")
+
+def _ask_ai(user_text: str) -> str:
+    # שלב 1: האם צריך חיפוש?
+    tavily_key = os.getenv("TAVILY_API_KEY")
+    context = ""
+
+    if tavily_key and _needs_search(user_text):
+        log.info("🔍 מחפש מידע עדכני...")
+        context = _tavily_search(user_text)
+        if context:
+            log.info(f"נמצא מידע: {context[:80]}...")
+
+    # שלב 2: בונה הודעה עם הקשר אם יש
+    user_message = user_text
+    if context:
+        user_message = f"[מידע עדכני מהאינטרנט]: {context}\n\nשאלה: {user_text}"
+
+    # שלב 3: Gemini ראשון, Groq כ-fallback
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    if gemini_key:
+        try:
+            log.info("🤖 שואל Gemini...")
+            return _ask_gemini(user_message)
+        except Exception as e:
+            log.warning(f"Gemini נכשל: {e} — עובר ל-Groq")
+
+    log.info("🤖 שואל Groq...")
+    return _ask_groq_fallback(user_message)
 
 
 # ===== שמע =====
@@ -326,9 +360,9 @@ def run_pipeline():
     log.info(f"שאלה: {user_text}")
 
     try:
-        ai_response = with_retry(_ask_groq, user_text)
+        ai_response = with_retry(_ask_ai, user_text)
     except Exception as e:
-        log.error(f"Groq נכשל: {e} — מעלה הודעת שגיאה קולית")
+        log.error(f"AI נכשל: {e} — מעלה הודעת שגיאה קולית")
         _upload_error_message(token)
         save_processed(target)
         return
